@@ -1,0 +1,194 @@
+---
+title: "Predict Items"
+output: html_document
+---
+
+```{r}
+library(xgboost)
+library(caret)
+library(tidyverse)
+```
+
+Load the data and make sure that all of the empty strings have been filled.
+
+```{r}
+df <- read.csv("logdata.csv")
+nrow(df)
+head(df)
+df[is.na(df)] <- "None"
+df[df==""] <- "None"
+
+```
+
+Filter out any target with less than 5 entries
+```{r}
+df <- df %>% 
+  group_by(target) %>% 
+  filter(n() > 5)
+df <- droplevels(df)
+nrow(df)
+```
+
+Build a function to get a dictionary mapper for the factors in the dataframe
+
+```{r}
+getItemDict <- function(columnvalues){
+  #Get a dictionary-like named vector for converting itemIds to numbers
+  targetfactors <- as.character(unique(columnvalues))
+  
+  if ('None' %in% targetfactors){
+    itemdict <- seq(length(targetfactors))
+    names(itemdict) <- targetfactors
+  }
+  else{
+    itemdict <- seq(length(targetfactors)+1)
+    names(itemdict) <- c('None',targetfactors)
+  }
+  return(itemdict)
+}
+
+
+```
+
+
+Create a dictionary for each one of the factor inputs
+
+```{r}
+itemdict <-  getItemDict(df$target)
+feature1dict <- getItemDict(df$feature1)
+feature2dict <- getItemDict(df$feature2)
+feature3dict <- getItemDict(df$feature3)
+feature4dict <- getItemDict(df$feature4)
+feature5dict <- getItemDict(df$feature5)
+feature6dict <- getItemDict(df$feature6)
+
+```
+
+Map all of the factors to numerical values
+
+```{r}
+getCodeorNone <- function(x,inputdictionary){
+  x <- as.character(x)
+  if (x %in% names(inputdictionary)){
+    return(unname(inputdictionary[x]))
+  }
+  else{
+    return(unname(inputdictionary['None']))
+  }
+}
+
+df$feature1.code <- sapply(df$feature1,function(x) getCodeorNone(x,feature1dict)[1])
+df$feature2.code <- sapply(df$feature2,function(x) getCodeorNone(x,feature2dict)[1])
+df$feature3.code <- sapply(df$feature3,function(x) getCodeorNone(x,feature3dict)[1])
+df$feature4.code <- sapply(df$feature4,function(x) getCodeorNone(x,feature4dict)[1])
+df$feature5.code <- sapply(df$feature5,function(x) getCodeorNone(x,feature5dict)[1])
+df$feature6.code <- sapply(df$feature6,function(x) getCodeorNone(x,feature6dict)[1])
+
+df$feature7.code <- sapply(df$feature7,function(x) getCodeorNone(x,itemdict)[1])
+df$feature8.code <- sapply(df$feature8,function(x) getCodeorNone(x,itemdict)[1])
+
+
+df$target.code <- sapply(df$target,function(x) getCodeorNone(x,itemdict)[1])
+
+```
+
+Create test/train split
+
+
+```{r}
+intrain<-createDataPartition(y=df$target.code,p=0.8,list=FALSE)
+
+features <- c('feature1.code',
+              'feature2.code',
+              'feature3.code',
+              'feature4.code',
+              'feature5.code',
+              'feature6.code',
+              'feature7.code',
+              'feature8.code')
+# Extract the rows and columns for test and train and convert to numeric (from int)
+train<-data.frame(lapply(df[intrain,c(features,'target.code')],as.numeric))
+test<-data.frame(lapply(df[-intrain,c(features,'target.code')],as.numeric))
+
+# Note that the label values should start at 0, so we subtract 1 from the entire array
+dtrain <- xgb.DMatrix( as.matrix(train[,features],nrows=nrow(train)),label=as.matrix(train[,'target.code'])-1)
+dtest <- xgb.DMatrix( as.matrix(test[,features],nrows=nrow(test)),label=as.matrix(test[,'target.code'])-1)
+
+```
+
+Set up the model for training including a custom evaluation function that looks for the label in the top 10 prediction probabilities. Run for 30 rounds for now - that seems to give decent out-of-sample performence.
+
+```{r}
+
+watchlist <- list(eval = dtest, train = dtrain)
+num_round <- 30
+
+# user defined evaluation function, return a pair metric_name, result
+# This function takes the top 10 predictions and checks to see if the target label is in that set.
+# The error is 1 - the fraction of rows where the label is in the top 10.
+
+evalerror <- function(preds, dtrain,topNvalue=10) {
+  actlabels <- getinfo(dtrain, "label")+1
+  mpreds <- matrix(preds,ncol=length(actlabels))
+  vals <- t(apply(t(mpreds),1, function(x) which(x >= sort(x, decreasing=T)[topNvalue])[1:topNvalue]))
+  err <- 1-sum(vals-actlabels == 0)/length(actlabels)
+  return(list(metric = "error", value = err))
+}
+
+param <- list(max_depth=10, eta=0.1, nthread = 3, silent=0, seed=42, num_class=length(itemdict),
+              objective='multi:softprob',eval_metric=evalerror) 
+
+bst <- xgb.train(param, dtrain, num_round, watchlist)
+```
+
+Save the model.
+
+```{r}
+xgb.save(bst, 'xgb.model')
+
+```
+
+Get predictions on the test set and get the "Traditional" accuracy - how likely was the top prediction to match the label.
+
+```{r}
+preds <- predict(bst, dtest)
+mpreds <- predict(bst, dtest, reshape=TRUE)
+test.labels <- getinfo(dtest, "label") + 1
+toppreds <- apply(mpreds,1, function(x) which.max(x))
+print("Accuracy")
+sum(toppreds == test.labels)/length(test.labels)
+```
+
+Check a random sample to double-check the top N prediction error.
+
+```{r}
+n <- sample(1:length(test.labels),1)
+topNvalue <- 10
+print("Actual")
+test.labels[n]
+print("Top")
+toppreds[n]
+vals <- t(apply(t(mpreds[n,]),1, function(x) which(x >= sort(x, decreasing=T)[topNvalue])[1:topNvalue]))
+print(paste0("Top ",topNvalue))
+vals
+print("Overall Performance")
+1 - evalerror( preds, dtest,topNvalue)$value
+```
+
+
+```{r}
+score.eval <- data.frame(topN=seq(1:40))
+score.eval$error <- mapply(function(x) evalerror(preds,dtest,x)$value,score.eval$topN)
+ggplot(score.eval, aes(x=topN, y=error)) +
+    geom_point() + ylim(0,1)     
+```
+
+
+Verify that the reload and scoring functions work.
+
+```{r}
+bst2 <- xgb.load('xgb.model')
+preds <- predict(bst2, dtest)
+print("Overall Performance")
+1 - evalerror( preds, dtest)$value
+```
