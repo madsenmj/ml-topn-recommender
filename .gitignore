@@ -1,6 +1,7 @@
 # History files
 .Rhistory
 .Rapp.history
+.ipynb_checkpoints
 
 # Session Data files
 .RData
